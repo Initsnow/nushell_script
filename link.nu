@@ -7,7 +7,13 @@ def main [] {
         let src = ($e.src | path expand);
         let linkto = ($e.linkto | path expand);
         mkdir -v $'($linkto | path dirname)';
-        do -i { mklink $linkto $src; }
+        do -i {
+          if ($src | path type) == "dir" {
+            mklink /J $linkto $src
+          } else {
+            mklink $linkto $src
+          }
+        }
       }
     } else if $kernel_name == "Linux" {
       for e in (open linkfiles.toml | get files) {
@@ -17,7 +23,7 @@ def main [] {
         do -i { ln -s $linkto $src; }
       }
     } else {
-      print "Unknown system" 
+      print "Unknown system"
     }
   } else {
     print "Run it as admin."
@@ -44,7 +50,13 @@ def "main remove" [] {
 
   if (is-admin) {
       for f in (open linkfiles.toml | get files.linkto) {
-        let $r = powershell rm $f | complete # Why not use built-in rm: https://github.com/nushell/nushell/issues/11652
+        let $f = ($f | path expand)
+        let is_dir = (do -i { $f | path type }) == "dir"
+        let $r = if $is_dir {
+          ^cmd /c rmdir $f | complete    # rmdir safely removes junction without touching target
+        } else {
+          ^cmd /c del /f $f | complete   # del /f safely removes file symlink
+        }
         if $r.exit_code == 0 {
           print $"Remove (ansi green)($f)(ansi reset) successfully"
         } else {
@@ -54,7 +66,7 @@ def "main remove" [] {
   } else {
     print "Run it as admin."
   }
-  
+
 }
 
 def checkTomlExists [] {
