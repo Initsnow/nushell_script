@@ -5,7 +5,12 @@ def main [] {
     if $kernel_name == "Windows_NT" {
       for e in (open linkfiles.toml | get files) {
         let src = ($e.src | path expand);
-        let linkto = ($e.linkto | path expand);
+        # path expand follows symlinks, so resolve linkto manually
+        let linkto = if ($e.linkto | str contains ':\\') or ($e.linkto | str starts-with '\\\\') {
+          $e.linkto
+        } else {
+          $env.PWD | path join $e.linkto
+        }
         mkdir -v $'($linkto | path dirname)';
         do -i {
           if ($src | path type) == "dir" {
@@ -18,9 +23,13 @@ def main [] {
     } else if $kernel_name == "Linux" {
       for e in (open linkfiles.toml | get files) {
         let src = ($e.src | path expand);
-        let linkto = ($e.linkto | path expand);
+        let linkto = if ($e.linkto | str starts-with '/') {
+          $e.linkto
+        } else {
+          $env.PWD | path join $e.linkto
+        }
         mkdir -v $'($linkto | path dirname)';
-        do -i { ln -s $linkto $src; }
+        do -i { ln -s $src $linkto; }
       }
     } else {
       print "Unknown system"
@@ -50,17 +59,26 @@ def "main remove" [] {
 
   if (is-admin) {
       for f in (open linkfiles.toml | get files.linkto) {
-        let $f = ($f | path expand)
-        let is_dir = (do -i { $f | path type }) == "dir"
-        let $r = if $is_dir {
-          ^cmd /c rmdir $f | complete    # rmdir safely removes junction without touching target
+        # path expand follows symlinks, so resolve relative paths manually
+        let $f = if ($f | str contains ':\\') or ($f | str starts-with '\\\\') {
+          $f  # already absolute (C:\... or \\...)
         } else {
-          ^cmd /c del /f $f | complete   # del /f safely removes file symlink
+          $env.PWD | path join $f  # relative path
         }
-        if $r.exit_code == 0 {
-          print $"Remove (ansi green)($f)(ansi reset) successfully"
+        let sym_type = (do -i { $f | path type })
+        if $sym_type == "symlink" {
+          let $r = ^fsutil reparsepoint delete $f | complete
+          if $r.exit_code == 0 {
+            do -i { ^cmd /c rmdir $f 2>nul }  # if it was a junction, now an empty directory
+            do -i { ^cmd /c del /q $f 2>nul }  # if it was a file symlink, now a regular file
+            print $"Remove (ansi green)($f)(ansi reset) successfully"
+          } else {
+            print -e $"(ansi red)($r.stderr)(ansi reset)"
+          }
+        } else if ($sym_type != null) {
+          print -e $"(ansi red)($f) is not a symlink/junction, skipping(ansi reset)"
         } else {
-          print -e $"(ansi red)($r.stderr | decode gbk)(ansi reset)"
+          print -e $"(ansi yellow)($f) does not exist, skipping(ansi reset)"
         }
       }
   } else {
