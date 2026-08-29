@@ -1,8 +1,7 @@
 remote=['onedrive','gdrive']
 
 [path]
-'C:\Users\Initsnow\Pictures'='Pictures'
-'C:\Users\Initsnow\Documents\backups\config'='backups\config'
-'C:\Users\Initsnow\Documents\backups\script'='backups\script'
+'C:\Users\Initsnow\Pictures'=['Pictures',"gdrive"]
+'C:\Users\Initsnow\Documents\windows-dotfiles'=['backups\windows-dotfiles',"onedrive"]
 'C:\Users\Initsnow\Documents\books'=['backups\books',"gdrive"]
-'C:\Users\Initsnow\Documents\music scores'='backups\music scores'
+'C:\Users\Initsnow\Documents\Audio'=['backups\Audio','gdrive']
