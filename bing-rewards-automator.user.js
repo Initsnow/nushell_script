@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bing Rewards 自动领取与任务助手
 // @namespace    https://github.com/yourname/bing-rewards-auto
-// @version      1.1.0
-// @description  在 Bing 搜索页自动领取 Rewards 积分、完成“打开即得/搜索即得”任务、自动跳过拼图任务；使用趋势词和相关搜索，带反检测随机化
+// @version      2.0.0
+// @description  在 Bing 搜索页自动领取 Rewards 积分、完成“打开即得/搜索即得”任务、自动跳过拼图任务；支持手动/空闲自动后台执行，多标签页协作，Violentmonkey 菜单控制与页内轻量状态
 // @author       you
 // @match        https://www.bing.com/*
 // @match        https://rewards.bing.com/*
@@ -11,6 +11,10 @@
 // @grant        GM_setValue
 // @grant        GM_deleteValue
 // @grant        GM_log
+// @grant        GM_registerMenuCommand
+// @grant        GM_unregisterMenuCommand
+// @grant        GM_notification
+// @grant        GM_openInTab
 // @license      MIT
 // ==/UserScript==
 
@@ -19,7 +23,17 @@
 
   // ========== 可调配置 ==========
   const CONFIG = {
-    AUTO_START: false,            // 安装后是否自动开始（false = 手动点面板“开始”）
+    AUTO_START: false,            // 安装后是否立即开始（手动启动仍可通过菜单）
+    AUTO_IDLE_ENABLED: true,      // 默认开启“空闲自动”检测（可由 Violentmonkey 菜单关闭）
+    IDLE_THRESHOLD_MS: 60000,     // 空闲多久后自动开始（无鼠标/键盘/滚动等操作）
+    IDLE_CHECK_INTERVAL_MS: 5000, // 空闲检测轮询间隔
+    ACTIVITY_THROTTLE_MS: 2000,   // 活动写入共享状态的最小间隔
+    WORKER_HEARTBEAT_MS: 5000,    // 后台工作标签页心跳
+    WORKER_TIMEOUT_MS: 20000,     // 超过该时间未心跳视为工作标签失效
+    WORKER_OPEN_COOLDOWN_MS: 15000, // 自动打开后台工作标签的最小间隔
+    PREFER_HIDDEN_TAB: true,      // 优先在隐藏/后台 Bing 标签页执行，避免影响当前浏览
+    OPEN_BACKGROUND_WORKER: true, // 没有后台标签时是否自动打开一个后台工作标签
+    ALLOW_FALLBACK_VISIBLE: true, // 实在无法打开后台标签时，是否允许在当前标签执行（手动模式更可用）
     AUTO_SEARCH_ENABLED: true,    // 是否自动做每日搜索
     MAX_SEARCHES_PER_RUN: 8,      // 每轮最多自动搜索次数（趋势词/相关搜索）
     TASK_WAIT_MIN_MS: 4000,       // 打开搜索/任务页后最短等待
@@ -34,37 +48,442 @@
     SCROLL_BEFORE_LEAVE: true     // 离开任务页前随机滚动，更像真人
   };
 
-  const STATE_KEY = 'bingRewardsAutoState_v1';
-  const TASK_KEY = 'bingRewardsTask_v1';
+  const STATE_KEY = 'bingRewardsAutoState_v2';
+  const LEGACY_STATE_KEY = 'bingRewardsAutoState_v1';
+  const TASK_KEY = 'bingRewardsTask_v2';
+  const LEGACY_TASK_KEY = 'bingRewardsTask_v1';
+  const TABS_KEY = 'bingRewardsAutoTabs_v2';
+  const ACTIVITY_KEY = 'bingRewardsAutoActivity_v2';
+  const STATUS_KEY = 'bingRewardsAutoStatus_v2';
   const DEFAULT_STATE = {
-    enabled: false,
+    enabled: false,              // 当前是否允许自动执行
+    idleAuto: CONFIG.AUTO_IDLE_ENABLED, // 是否开启空闲自动检测
+    runSource: 'manual',         // 'manual' | 'idle'
     processed: {},
     queue: [],
-    sessionTaskCount: 0
+    sessionTaskCount: 0,
+    worker: null,                // { tabId, ts } 当前唯一后台工作标签
+    lastWorkerRequestAt: 0,      // 上一次请求打开后台工作标签的时间
+    workerRequestBy: null,       // 当前正在负责打开后台标签的标签 ID
+    idleStartRequest: null,      // 空闲自动启动的临时占位，避免多个标签同时启动
+    doneDate: ''                 // 当天任务全部完成日期（避免空闲自动反复空跑）
   };
 
   // ========== 存储 ==========
   function loadState() {
-    const s = GM_getValue(STATE_KEY, DEFAULT_STATE);
-    return Object.assign({}, DEFAULT_STATE, s);
+    const s = GM_getValue(STATE_KEY, null);
+    if (s) return Object.assign({}, DEFAULT_STATE, s);
+
+    // 从旧版状态迁移，避免升级后丢失已完成记录
+    const legacy = GM_getValue(LEGACY_STATE_KEY, null);
+    if (legacy) {
+      const migrated = Object.assign({}, DEFAULT_STATE, {
+        enabled: !!legacy.enabled,
+        processed: legacy.processed || {},
+        queue: legacy.queue || [],
+        sessionTaskCount: legacy.sessionTaskCount || 0
+      });
+      GM_setValue(STATE_KEY, migrated);
+      return migrated;
+    }
+
+    return Object.assign({}, DEFAULT_STATE);
   }
   function saveState(state) { GM_setValue(STATE_KEY, state); }
-  function loadTask() { return GM_getValue(TASK_KEY, null); }
+  function loadTask() {
+    return GM_getValue(TASK_KEY, GM_getValue(LEGACY_TASK_KEY, null));
+  }
   function saveTask(task) { GM_setValue(TASK_KEY, task); }
-  function clearTask() { GM_deleteValue(TASK_KEY); }
+  function clearTask() {
+    GM_deleteValue(TASK_KEY);
+    GM_deleteValue(LEGACY_TASK_KEY);
+  }
+
+  // 标签注册/活动/状态使用独立存储，避免频繁心跳覆盖任务队列等核心状态
+  function loadTabs() { return GM_getValue(TABS_KEY, {}); }
+  function saveTabs(tabs) { GM_setValue(TABS_KEY, tabs); }
+  function loadActivity() {
+    const a = GM_getValue(ACTIVITY_KEY, null);
+    if (a) return a;
+    const init = { lastActivityAt: Date.now() };
+    try { saveActivity(init); } catch (e) {}
+    return init;
+  }
+  function saveActivity(activity) { GM_setValue(ACTIVITY_KEY, activity); }
+  function loadStatusMessage() { return GM_getValue(STATUS_KEY, ''); }
+  function saveStatusMessage(msg) { GM_setValue(STATUS_KEY, msg); }
+
+  // ========== 标签页身份 / 空闲检测 / 多标签协作 ==========
+  const TAB_PREFIX = '__bingRewardsAutoTab_';
+  function getTabId() {
+    try {
+      if (window.name && window.name.indexOf(TAB_PREFIX) === 0) {
+        return window.name.slice(TAB_PREFIX.length);
+      }
+    } catch (e) {}
+    const id = 'tab-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+    try { window.name = TAB_PREFIX + id; } catch (e) {}
+    return id;
+  }
+  const TAB_ID = getTabId();
+
+  let statusEl = null;
+  let idleTimer = null;
+  let heartbeatTimer = null;
+
+  function workerActive(state) {
+    return !!(state && state.worker && state.worker.tabId &&
+      Date.now() - state.worker.ts < CONFIG.WORKER_TIMEOUT_MS);
+  }
+  function isCurrentWorker(state) {
+    return !!(state && state.worker && state.worker.tabId === TAB_ID &&
+      Date.now() - state.worker.ts < CONFIG.WORKER_TIMEOUT_MS);
+  }
+  function hiddenWorkerActive(state) {
+    if (!workerActive(state) || state.worker.tabId === TAB_ID) return false;
+    const tabs = loadTabs();
+    const t = tabs[state.worker.tabId];
+    // 工作标签没来得及注册心跳时也先按“有后台工作标签”处理，避免双跑
+    return !t ? true : t.visible === false;
+  }
+  function hiddenTabAvailable(state) {
+    const now = Date.now();
+    return Object.values(loadTabs()).some(t =>
+      t.visible === false &&
+      /^https:\/\/www\.bing\.com(?:\/|$)/.test(t.url || '') &&
+      now - (t.heartbeat || 0) < CONFIG.WORKER_TIMEOUT_MS
+    );
+  }
+
+  function claimWorker() {
+    const state = loadState();
+    if (workerActive(state) && state.worker.tabId !== TAB_ID) return false;
+    // 优先把执行权交给隐藏标签；当前标签可见且已有隐藏标签时，不抢占
+    if (CONFIG.PREFER_HIDDEN_TAB && document.visibilityState !== 'hidden' && hiddenTabAvailable(state)) {
+      return false;
+    }
+    if (CONFIG.PREFER_HIDDEN_TAB && document.visibilityState !== 'hidden') {
+      // 可见标签只有在没有隐藏标签可用时才允许接管（便于手动模式兜底）
+      if (hiddenTabAvailable(state)) return false;
+    }
+    state.worker = { tabId: TAB_ID, ts: Date.now() };
+    saveState(state);
+    log('当前标签接管后台执行');
+    return true;
+  }
+
+  function ensureWorkerTab() {
+    const state = loadState();
+
+    // 已经有可用的工作标签就直接复用，避免不断开新标签
+    if (workerActive(state) && state.worker.tabId !== TAB_ID) return;
+
+    // 当前标签本身就是隐藏标签，直接作为工作标签
+    if (document.visibilityState === 'hidden') {
+      claimWorker();
+      return;
+    }
+
+    // 已经有隐藏 Bing 标签时，交给它接管，不再重复开新标签
+    if (CONFIG.PREFER_HIDDEN_TAB && hiddenTabAvailable(state)) return;
+
+    // 可见标签：优先尝试自动打开一个后台工作标签
+    if (CONFIG.OPEN_BACKGROUND_WORKER && typeof GM_openInTab === 'function') {
+      const now = Date.now();
+      if (now - (state.lastWorkerRequestAt || 0) > CONFIG.WORKER_OPEN_COOLDOWN_MS) {
+        state.lastWorkerRequestAt = now;
+        state.workerRequestBy = TAB_ID;
+        saveState(state);
+        log('准备打开后台工作标签页...');
+        // 短暂延迟后确认自己仍是唯一负责打开者，避免多个标签同时开新标签
+        setTimeout(() => {
+          const st = loadState();
+          if (st.workerRequestBy !== TAB_ID) return;
+          if (workerActive(st) || !st.enabled) return;
+          if (CONFIG.PREFER_HIDDEN_TAB && hiddenTabAvailable(st)) return;
+          st.workerRequestBy = null;
+          saveState(st);
+          try {
+            GM_openInTab('https://www.bing.com/?__rwdAuto=1', { active: false, insert: true });
+            log('已打开后台工作标签页');
+          } catch (e) {
+            log('打开后台工作标签失败: ' + e.message);
+            // 打开失败时按配置允许在当前可见标签兜底执行
+            if (CONFIG.ALLOW_FALLBACK_VISIBLE && !workerActive(loadState()) && !hiddenTabAvailable(loadState())) {
+              if (claimWorker()) runAutomation();
+            }
+          }
+        }, randomInt(300, 900));
+      }
+      return;
+    }
+
+    // 没有打开后台标签的能力或已关闭该功能，才允许在当前可见标签执行
+    if (CONFIG.ALLOW_FALLBACK_VISIBLE) {
+      claimWorker();
+    } else {
+      log('没有可用的后台标签页，已跳过自动执行（可手动打开一个 Bing 后台标签）');
+    }
+  }
+
+  // 用户活动上报：所有 Bing 标签都会更新“最后活动时间”
+  function reportActivity() {
+    const now = Date.now();
+    const activity = loadActivity();
+    if (now - (activity.lastActivityAt || 0) >= CONFIG.ACTIVITY_THROTTLE_MS) {
+      activity.lastActivityAt = now;
+      saveActivity(activity);
+    }
+
+    const state = loadState();
+    // 若当前是空闲自动在跑，且用户正在操作当前可见 Bing 标签，立即暂停避免影响浏览
+    if (state.enabled && state.runSource === 'idle' &&
+        document.visibilityState === 'visible' && document.hasFocus()) {
+      state.enabled = false;
+      saveState(state);
+      log('检测到你在使用 Bing，已自动暂停');
+    }
+    updateStatusUI();
+  }
+
+  function installActivityListeners() {
+    const events = ['mousemove', 'mousedown', 'keydown', 'scroll', 'wheel', 'touchstart', 'pointerdown'];
+    for (const ev of events) {
+      window.addEventListener(ev, reportActivity, { passive: true, capture: true });
+    }
+    window.addEventListener('focus', reportActivity);
+    document.addEventListener('visibilitychange', () => {
+      reportActivity();
+      heartbeat();
+      updateStatusUI();
+    });
+    window.addEventListener('pagehide', () => {
+      try {
+        const tabs = loadTabs();
+        delete tabs[TAB_ID];
+        saveTabs(tabs);
+        // 不在这里清空 worker：跨页面/跨域导航时旧 worker 继续作为“占位”，
+        // 新页面加载后会用相同 TAB_ID 刷新心跳，避免其他标签抢跑。
+      } catch (e) {}
+    });
+  }
+
+  function heartbeat() {
+    const now = Date.now();
+    const tabs = loadTabs();
+    tabs[TAB_ID] = {
+      heartbeat: now,
+      visible: !document.hidden,
+      focused: document.hasFocus(),
+      url: location.href
+    };
+    // 清理失联标签
+    for (const id of Object.keys(tabs)) {
+      if (id !== TAB_ID && now - (tabs[id].heartbeat || 0) > CONFIG.WORKER_TIMEOUT_MS * 2) {
+        delete tabs[id];
+      }
+    }
+    saveTabs(tabs);
+
+    // 刷新工作标签心跳（只有工作标签才写主状态，尽量避免覆盖任务状态）
+    const state = loadState();
+    if (isCurrentWorker(state)) {
+      state.worker.ts = now;
+      saveState(state);
+    }
+  }
+
+  // ========== 页内轻量状态（嵌入 Bing 页面，不遮挡内容） ==========
+  function ensureStatusEl() {
+    if (statusEl && document.documentElement.contains(statusEl)) return statusEl;
+    statusEl = document.createElement('div');
+    statusEl.id = 'bingRewardsAutoStatusChip';
+    statusEl.style.cssText = [
+      'display:inline-flex', 'align-items:center', 'gap:4px',
+      'margin:0 0 0 10px', 'padding:2px 8px',
+      'background:rgba(255,255,255,.88)', 'border:1px solid rgba(0,0,0,.10)',
+      'border-radius:999px', 'font:11px/1.4 system-ui,-apple-system,sans-serif',
+      'color:#444', 'box-shadow:0 1px 3px rgba(0,0,0,.07)',
+      'vertical-align:middle', 'white-space:nowrap', 'overflow:hidden',
+      'text-overflow:ellipsis', 'max-width:320px'
+    ].join(';');
+    statusEl.title = 'Bing Rewards 自动助手';
+
+    // 优先嵌入 Bing 顶部 header，让状态条随页面排版出现，而不是悬浮遮挡正文
+    const header = document.querySelector('#b_header, header, .b_header');
+    if (header) {
+      header.appendChild(statusEl);
+    } else if (document.body) {
+      statusEl.style.position = 'fixed';
+      statusEl.style.left = '10px';
+      statusEl.style.bottom = '10px';
+      statusEl.style.zIndex = '2147483647';
+      statusEl.style.pointerEvents = 'none';
+      document.body.appendChild(statusEl);
+    }
+    return statusEl;
+  }
+
+  function updateStatusUI() {
+    const el = ensureStatusEl();
+    if (!el) return;
+    const s = loadState();
+    const statusMessage = loadStatusMessage();
+    let text = statusMessage || '';
+    if (!text) {
+      text = s.enabled ? '🟢 运行中' : '⚪ 待机';
+      if (s.idleAuto) text += ' · 空闲自动';
+      if (s.queue && s.queue.length) text += ` · 队列${s.queue.length}`;
+      if (s.worker) text += s.worker.tabId === TAB_ID ? ' · 本页执行' : ' · 后台执行';
+    }
+    el.textContent = text;
+    const queued = (s.queue || []).length;
+    el.title = `Bing Rewards 助手\n启用: ${s.enabled ? '是' : '否'} (${s.runSource})\n空闲自动: ${s.idleAuto ? '开' : '关'}\n队列: ${queued}\n已完成: ${Object.keys(s.processed || {}).length}\n最近: ${statusMessage || '无'}`;
+  }
+
+  // ========== 控制（Violentmonkey 菜单） ==========
+  function setEnabled(on, source) {
+    const s = loadState();
+    s.enabled = !!on;
+    s.runSource = source || 'manual';
+    saveState(s);
+    log(on ? `已${source === 'idle' ? '空闲自动' : '手动'}启动` : '已停止');
+    if (on) {
+      ensureWorkerTab();
+      // 若当前标签就是工作标签（隐藏标签或可见兜底），立即开始跑
+      const st = loadState();
+      if (isCurrentWorker(st)) runAutomation();
+    }
+    updateStatusUI();
+  }
+
+  function startAutomation(source) {
+    setEnabled(true, source || 'manual');
+  }
+
+  function stopAutomation() {
+    setEnabled(false, 'manual');
+  }
+
+  function setIdleAuto(on) {
+    const s = loadState();
+    s.idleAuto = !!on;
+    saveState(s);
+    log(`空闲自动已${on ? '开启' : '关闭'}`);
+    updateStatusUI();
+  }
+
+  function toggleIdleAuto() {
+    setIdleAuto(!loadState().idleAuto);
+  }
+
+  function clearAll() {
+    const s = loadState();
+    s.processed = {};
+    s.queue = [];
+    s.doneDate = '';
+    saveState(s);
+    log('已清空完成记录与队列');
+    updateStatusUI();
+  }
+
+  function showStatus() {
+    const s = loadState();
+    const activity = loadActivity();
+    const msg = [
+      'Bing Rewards 助手',
+      `启用: ${s.enabled ? '是' : '否'} (${s.runSource})`,
+      `空闲自动: ${s.idleAuto ? '开' : '关'}`,
+      `队列: ${(s.queue || []).length}`,
+      `已完成: ${Object.keys(s.processed || {}).length}`,
+      `工作标签: ${s.worker ? s.worker.tabId : '无'}`,
+      `上次活动: ${activity.lastActivityAt ? new Date(activity.lastActivityAt).toLocaleTimeString() : '未知'}`
+    ].join('\n');
+    if (typeof GM_notification === 'function') {
+      try { GM_notification({ title: 'Bing Rewards 助手', text: msg }); } catch (e) {}
+    } else {
+      try { alert(msg); } catch (e) {}
+    }
+    log(msg.replace(/\n/g, ' | '));
+  }
+
+  function registerMenuCommands() {
+    if (typeof GM_registerMenuCommand !== 'function') return;
+    try {
+      GM_registerMenuCommand('▶ 开始手动运行', () => startAutomation('manual'));
+      GM_registerMenuCommand('⏹ 停止', stopAutomation);
+      GM_registerMenuCommand('🌙 开启空闲自动', () => setIdleAuto(true));
+      GM_registerMenuCommand('🌙 关闭空闲自动', () => setIdleAuto(false));
+      GM_registerMenuCommand('⚡ 立即开启一轮', () => startAutomation('manual'));
+      GM_registerMenuCommand('🗑 清空记录', clearAll);
+      GM_registerMenuCommand('📊 查看状态', showStatus);
+    } catch (e) {
+      log('注册 Violentmonkey 菜单失败: ' + e.message);
+    }
+  }
+
+  // 空闲检测：在所有匹配页面轮询，发现空闲就自动开启后台执行
+  function tryRequestIdleStart() {
+    const now = Date.now();
+    let s = loadState();
+    if (!s.idleAuto || s.enabled) return;
+    const activity = loadActivity();
+    const idleMs = now - (activity.lastActivityAt || now);
+    if (idleMs < CONFIG.IDLE_THRESHOLD_MS) return;
+
+    // 当天已完成且队列为空时，空闲自动不再反复空跑
+    if (s.doneDate === todayKey() && !((s.queue || []).length)) return;
+
+    // 如果有其他人刚申请启动，不重复排队
+    if (s.idleStartRequest && now - s.idleStartRequest.ts < 5000) return;
+
+    s.idleStartRequest = { tabId: TAB_ID, ts: now };
+    saveState(s);
+    log('检测到浏览器空闲，准备自动开始...');
+
+    // 短暂等待后确认自己仍是唯一的启动者，避免多标签同时抢跑
+    setTimeout(() => {
+      const st = loadState();
+      if (!st.idleAuto || st.enabled) return;
+      if (!st.idleStartRequest || st.idleStartRequest.tabId !== TAB_ID) return;
+      if (workerActive(st)) return;
+      st.idleStartRequest = null;
+      saveState(st);
+      startAutomation('idle');
+    }, randomInt(400, 1200));
+  }
+
+  function startIdleMonitor() {
+    if (idleTimer) clearInterval(idleTimer);
+    idleTimer = setInterval(() => {
+      heartbeat();
+      tryRequestIdleStart();
+
+      // 已启用但没有工作标签时，定时尝试恢复（例如后台标签打开失败后自动兜底）
+      const s = loadState();
+      if (s.enabled && !workerActive(s)) {
+        if (document.visibilityState === 'hidden') {
+          if (claimWorker()) runAutomation();
+        } else {
+          ensureWorkerTab();
+          const st = loadState();
+          if (isCurrentWorker(st)) runAutomation();
+        }
+      }
+
+      updateStatusUI();
+    }, CONFIG.IDLE_CHECK_INTERVAL_MS);
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    heartbeatTimer = setInterval(heartbeat, CONFIG.WORKER_HEARTBEAT_MS);
+  }
 
   // ========== 工具 ==========
   function log(msg) {
     const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
     console.log('[BingRewardsAuto]', msg);
     try { GM_log('[BingRewardsAuto] ' + msg); } catch (e) {}
-    const box = document.getElementById('bingRewardsAutoLog');
-    if (box) {
-      const div = document.createElement('div');
-      div.textContent = line;
-      box.appendChild(div);
-      box.scrollTop = box.scrollHeight;
-    }
+    try { saveStatusMessage(msg); } catch (e) {}
+    if (typeof updateStatusUI === 'function') updateStatusUI();
   }
 
   function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -668,8 +1087,25 @@
 
   // ========== 主流程 ==========
   async function runAutomation() {
-    const state = loadState();
+    let state = loadState();
     if (!state.enabled) return;
+
+    // 多标签协作：已有其他工作标签时，当前标签不执行
+    if (workerActive(state) && state.worker.tabId !== TAB_ID) return;
+
+    // 刚请求打开后台工作标签，给后台标签一点加载/接管时间
+    if (document.visibilityState !== 'hidden' &&
+        state.lastWorkerRequestAt &&
+        Date.now() - state.lastWorkerRequestAt < CONFIG.WORKER_OPEN_COOLDOWN_MS) {
+      return;
+    }
+
+    // 可见标签不抢占已有隐藏工作标签
+    if (document.visibilityState !== 'hidden' && hiddenWorkerActive(state)) return;
+
+    // 成为工作标签（隐藏标签优先；可见标签仅作为兜底）
+    if (!isCurrentWorker(state) && !claimWorker()) return;
+    state = loadState();
 
     // 如果当前正在处理任务，先收尾
     if (loadTask()) {
@@ -717,8 +1153,9 @@
     if (state2.queue.length === 0) {
       log('今天好像都完成了 🎉');
       state2.enabled = false;
+      state2.doneDate = todayKey();
       saveState(state2);
-      updatePanelStatus();
+      updateStatusUI();
       return;
     }
 
@@ -749,88 +1186,43 @@
     location.href = withTaskParam(task.url);
   }
 
-  // ========== 控制面板 ==========
-  function injectPanel() {
-    if (document.getElementById('bingRewardsAutoPanel')) return;
-
-    const panel = document.createElement('div');
-    panel.id = 'bingRewardsAutoPanel';
-    panel.style.cssText = [
-      'position:fixed', 'right:12px', 'bottom:12px', 'z-index:2147483647',
-      'width:320px', 'max-height:380px', 'background:#1f1f1f', 'color:#eee',
-      'border:1px solid #555', 'border-radius:10px',
-      'font:12px/1.5 system-ui,sans-serif',
-      'box-shadow:0 4px 20px rgba(0,0,0,.5)',
-      'display:flex', 'flex-direction:column', 'overflow:hidden'
-    ].join(';');
-
-    panel.innerHTML = `
-      <div style="padding:8px 10px;background:#2d2d2d;font-weight:bold;display:flex;justify-content:space-between;align-items:center;">
-        <span>🪙 Bing Rewards 助手</span>
-        <span id="bingRewardsAutoStatus" style="font-size:11px;color:#f44336;">已停止</span>
-      </div>
-      <div style="padding:8px 10px;display:flex;gap:6px;flex-wrap:wrap;">
-        <button id="bingRewardsAutoStart" style="padding:4px 10px;border:0;border-radius:6px;background:#4caf50;color:#fff;cursor:pointer;">▶ 开始</button>
-        <button id="bingRewardsAutoStop" style="padding:4px 10px;border:0;border-radius:6px;background:#f44336;color:#fff;cursor:pointer;">⏹ 停止</button>
-        <button id="bingRewardsAutoClear" style="padding:4px 10px;border:0;border-radius:6px;background:#607d8b;color:#fff;cursor:pointer;">🗑 清空记录</button>
-      </div>
-      <div id="bingRewardsAutoLog" style="flex:1;overflow-y:auto;padding:6px 10px;border-top:1px solid #444;min-height:100px;"></div>
-    `;
-    document.body.appendChild(panel);
-
-    document.getElementById('bingRewardsAutoStart').addEventListener('click', () => {
-      const s = loadState();
-      s.enabled = true;
-      saveState(s);
-      updatePanelStatus();
-      log('已开启自动任务');
-      runAutomation();
-    });
-
-    document.getElementById('bingRewardsAutoStop').addEventListener('click', () => {
-      const s = loadState();
-      s.enabled = false;
-      saveState(s);
-      updatePanelStatus();
-      log('已停止');
-    });
-
-    document.getElementById('bingRewardsAutoClear').addEventListener('click', () => {
-      const s = loadState();
-      s.processed = {};
-      s.queue = [];
-      saveState(s);
-      log('已清空完成记录');
-    });
-  }
-
-  function updatePanelStatus() {
-    const s = loadState();
-    const el = document.getElementById('bingRewardsAutoStatus');
-    if (el) {
-      el.textContent = s.enabled ? '运行中' : '已停止';
-      el.style.color = s.enabled ? '#8bc34a' : '#f44336';
-    }
-  }
-
   // ========== 启动 ==========
   async function main() {
-    injectPanel();
-    updatePanelStatus();
+    installActivityListeners();
+    registerMenuCommands();
+    heartbeat();
+    // 用户正在看这个 Bing 标签时记为一次活动，避免刚打开就立刻被空闲逻辑接管
+    if (document.visibilityState === 'visible') reportActivity();
+    ensureStatusEl();
+    updateStatusUI();
+    startIdleMonitor();
 
-    // 正在处理任务：先完成当前任务
+    // 当前有未完成任务：只交给工作标签处理，避免多个标签重复执行
     if (loadTask()) {
-      await handleCurrentTask();
+      const st = loadState();
+      if (isCurrentWorker(st)) {
+        await handleCurrentTask();
+      } else if (!workerActive(st)) {
+        // 没有工作标签时：隐藏标签直接接管；可见标签先尝试开后台标签
+        if (document.visibilityState === 'hidden') {
+          if (claimWorker()) await handleCurrentTask();
+        } else {
+          ensureWorkerTab();
+          const st2 = loadState();
+          if (isCurrentWorker(st2)) await handleCurrentTask();
+        }
+      }
+      return;
+    }
+
+    if (CONFIG.AUTO_START) {
+      startAutomation('manual');
       return;
     }
 
     const state = loadState();
     if (state.enabled) {
-      await runAutomation();
-    } else if (CONFIG.AUTO_START) {
-      state.enabled = true;
-      saveState(state);
-      updatePanelStatus();
+      ensureWorkerTab();
       await runAutomation();
     }
   }
