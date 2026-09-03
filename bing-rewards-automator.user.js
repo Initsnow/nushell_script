@@ -45,7 +45,11 @@
     HUMAN_PAUSE_EVERY: 3,         // 每完成 N 个任务暂停一次
     HUMAN_PAUSE_MIN_MS: 10000,    // 暂停范围（模拟人离开/浏览）
     HUMAN_PAUSE_MAX_MS: 30000,
-    SCROLL_BEFORE_LEAVE: true     // 离开任务页前随机滚动，更像真人
+    SCROLL_BEFORE_LEAVE: true,    // 离开任务页前随机滚动，更像真人
+    TAB_BADGE: true,              // 是否在任务执行标签页修改标题/图标，方便观察
+    TAB_BADGE_ON_WORKER_ONLY: true, // 只改执行任务的那个标签；false = 所有 Bing 标签都显示状态
+    TAB_BADGE_EMOJI: '🤖',        // 标签图标使用的 emoji
+    TAB_TITLE_PREFIX: 'BingRewards ' // 标签标题前缀
   };
 
   const STATE_KEY = 'bingRewardsAutoState_v2';
@@ -339,6 +343,67 @@
     el.textContent = text;
     const queued = (s.queue || []).length;
     el.title = `Bing Rewards 助手\n启用: ${s.enabled ? '是' : '否'} (${s.runSource})\n空闲自动: ${s.idleAuto ? '开' : '关'}\n队列: ${queued}\n已完成: ${Object.keys(s.processed || {}).length}\n最近: ${statusMessage || '无'}`;
+    updateTabBadge();
+  }
+
+  // ========== 标签页标题/图标标记（方便识别执行中的工作标签） ==========
+  let originalTitle = null;
+  let originalFaviconHref = null;
+  let tabBadgeApplied = false;
+
+  function getFaviconLink() {
+    return document.querySelector('link[rel="icon"], link[rel="shortcut icon"]');
+  }
+
+  function setTabFavicon(emoji) {
+    let link = getFaviconLink();
+    if (!link) {
+      link = document.createElement('link');
+      link.rel = 'icon';
+      document.head.appendChild(link);
+    }
+    const svg = `<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='88'>${emoji}</text></svg>`;
+    link.href = 'data:image/svg+xml,' + encodeURIComponent(svg);
+  }
+
+  function restoreTabFavicon() {
+    const link = getFaviconLink();
+    if (!link) return;
+    if (originalFaviconHref) {
+      link.href = originalFaviconHref;
+    } else {
+      // 原本没有 favicon 时移除我们添加的
+      if (tabBadgeApplied && link.href && link.href.indexOf('data:image/svg+xml') === 0) {
+        link.remove();
+      }
+    }
+  }
+
+  function updateTabBadge() {
+    if (!CONFIG.TAB_BADGE) return;
+    const s = loadState();
+    const isWorkerTab = isCurrentWorker(s);
+    const shouldBadge = s.enabled && (CONFIG.TAB_BADGE_ON_WORKER_ONLY ? isWorkerTab : true);
+
+    if (originalTitle === null) {
+      originalTitle = document.title;
+    }
+    if (originalFaviconHref === null) {
+      const link = getFaviconLink();
+      originalFaviconHref = link ? link.href : null;
+    }
+
+    if (shouldBadge) {
+      const done = Object.keys(s.processed || {}).length;
+      const queued = (s.queue || []).length;
+      document.title = `${CONFIG.TAB_BADGE_EMOJI} ${CONFIG.TAB_TITLE_PREFIX}${s.runSource === 'idle' ? '空闲' : '手动'} · 队列${queued} · 已完成${done}`;
+      setTabFavicon(CONFIG.TAB_BADGE_EMOJI);
+      tabBadgeApplied = true;
+    } else if (tabBadgeApplied) {
+      if (originalTitle !== null) document.title = originalTitle;
+      restoreTabFavicon();
+      tabBadgeApplied = false;
+    }
   }
 
   // ========== 控制（Violentmonkey 菜单） ==========
